@@ -1,5 +1,7 @@
 # Indicador de voz
 
+![Demo](demo.gif)
+
 Una tarjeta flotante en la esquina de la pantalla que muestra quién tiene la
 palabra —tú dictando, o el agente pensando y hablando— **y qué texto hay en
 juego** en cada momento.
@@ -12,16 +14,16 @@ invisible a los cinco minutos y encima estorba.
 | En pantalla | Color | Significado | Quién lo publica |
 |---|---|---|---|
 | Grabando | rojo, latiendo | VoxType está capturando tu voz | VoxType |
-| Transcribiendo… | ámbar, fijo | Whisper está trabajando | VoxType |
+| Transcribiendo… | ámbar, latiendo | Whisper está trabajando | VoxType |
 | Recibido | ámbar, fijo | Lo que entendió Whisper, tal cual | `corregir` |
-| Corrigiendo… | morado, fijo | El LLM está repasando la transcripción | `corregir` |
+| Corrigiendo… | morado, latiendo | El LLM está repasando la transcripción | `corregir` |
 | Pegado | verde, fijo | El texto final, con los cambios resaltados | `pegar` |
-| Claude pensando… | azul, fijo | El agente está generando la respuesta | hook del agente |
+| Claude pensando… | azul, latiendo | El agente está generando la respuesta | hook del agente |
 | Claude hablando | verde, latiendo | El TTS está leyendo la respuesta | script de voz |
 
-Late solo lo que está vivo en ese instante. Lo que es una espera o un
-resultado se queda fijo, para que el movimiento signifique algo en vez de ser
-decoración.
+Late todo lo que está en marcha (grabar, transcribir, corregir, pensar,
+hablar); los resultados —`Recibido` y `Pegado`— se quedan fijos, para que el
+movimiento signifique algo en vez de ser decoración.
 
 Si coinciden varios, gana el de más arriba en la tabla, con dos excepciones
 que no son evidentes:
@@ -44,9 +46,18 @@ El recuento ("4 correcciones") cuenta **tramos seguidos**, no palabras
 sueltas: `hola Macla → Ollama Cloud` son dos palabras pero una sola
 corrección, que es como lo contaría cualquiera al mirarlo.
 
-`Pegado` y `Recibido` se desvanecen solos (6 s y 12 s). Hace falta porque el
+En `Pegado` con texto aparecen dos botones: **Copiar** (devuelve el texto al
+portapapeles) y **X** (esconde la tarjeta). La X solo la oculta localmente —
+no toca el estado compartido, que VoxType sigue en lo suyo.
+
+La etiqueta de estado va en negrita y mayor; el texto dictado, pequeño y
+tenue. Jerarquía: primero se lee qué pasa, después el texto.
+
+`Pegado` y `Recibido` se desvanecen solos (10 s y 12 s). Hace falta porque el
 script que los escribió ya terminó: nadie va a apagarlos, y ningún evento de
-archivo va a avisar. De ahí el sondeo de respaldo cada segundo.
+archivo va a avisar. De ahí el sondeo de respaldo cada segundo. El más largo
+es `Pegado`: muestra los botones Copiar/X y hace falta tiempo para leer y
+decidir; tener el ratón encima pausa el cierre.
 
 **Los estados de espera muestran los segundos** ("Corrigiendo… 4 s") y su
 punto late. Sin eso la tarjeta parece colgada, que es justo la impresión que
@@ -82,6 +93,11 @@ funcionaban y el que tardaba 11 s era el modelo.
 | `corrector.py` | Manda la transcripción a un LLM para que la repase. |
 | `corregir` | Hook `post_process` de VoxType: stdin → stdout. |
 | `pegar` | Hook `post_output_command`: pulsa Ctrl+Shift+V y marca "Pegado". |
+
+El servicio systemd y los hooks se configuran fuera del repo, referenciados
+por rutas absolutas desde `~/.config/systemd/user/indicador-voz.service` y
+`~/.config/voxtype/config.toml`. La cadena necesita `ydotool` y `xclip`
+instalados. Clonar el repo no basta para reproducir el montaje.
 
 ## Corrección de transcripciones
 
@@ -133,9 +149,13 @@ transcrito, antes de que aparezca en la ventana, así que se nota mucho.
 
 `gemma4` fue además de los pocos que sacó *"presencia"* de *"presidencia"*.
 
+<details>
+<summary>Mediciones completas: variantes de Gemma, descartes y notas</summary>
+
 #### Otras variantes de Gemma
 
-En Ollama Cloud solo hay `gemma4:31b`. En OpenRouter hay más, y se midieron:
+En Ollama Cloud solo hay `gemma4:31b`. En OpenRouter hay más, y se midieron
+(segunda tanda, sesión distinta):
 
 | Modelo | Mediana | p90 | Peor | Notas |
 |---|---|---|---|---|
@@ -168,6 +188,8 @@ Descartados por comportamiento, no por velocidad: **`gpt-5-nano` filtraba su
 propio razonamiento** dentro del texto ("Wait. Follow rules: correct only…"),
 que se habría pegado tal cual; `mistral-nemo` tardaba 6,6 s y reformulaba;
 `minimax-m3` convirtió *"presidencia"* en *"presentación"*.
+
+</details>
 
 Las claves salen de `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` o, si no están, de
 donde las guarda OpenCode (`~/.local/share/opencode/auth.json`). Pese al nombre,
@@ -208,27 +230,18 @@ Para probar sin pegar nada:
 echo "lo hice en Cloud IP con Boxed" | ./corregir
 ```
 
-**Aviso:** el texto dictado se envía a OpenRouter. Si dictas algo que no deba
-salir del equipo, pon `"activo": false`.
+**Aviso:** el texto dictado se envía al proveedor configurado (Ollama Cloud
+por defecto). Si dictas algo que no deba salir del equipo, pon `"activo":
+false`.
 
 ### La trampa de xclip (histórica, pero no la repitas)
 
-El montaje anterior corregía desde `post_output_command`, leyendo y
-escribiendo el portapapeles con `xclip`. Funcionaba, pero colgaba a VoxType:
-
-`xclip` sale con código 0 pero **deja un hijo vivo** — en X11 quien ofrece el
-portapapeles tiene que seguir existiendo para servirlo. Ese hijo heredaba
-stdout y stderr de la tubería que VoxType crea para leer el hook, y esa
-tubería nunca daba EOF. VoxType lo espera para dar por terminado el pegado, así
-que se quedaba en `transcribing` para siempre — con el texto ya pegado y todo
-aparentemente bien.
-
-Mover la corrección a `post_process` (stdin/stdout) elimina el problema de
-raíz. Pero si alguna vez añades una orden que sobreviva al script, mándale
-stdout y stderr a `/dev/null` y usa `start_new_session=True`.
-
-Ver un `xclip` vivo en `ps` es normal y correcto: es el que sostiene el
-portapapeles.
+El montaje anterior usaba `xclip` desde `post_output_command`. `xclip` deja un
+hijo vivo que hereda las tuberías de VoxType; la tubería nunca da EOF y VoxType
+se queda en `transcribing` para siempre. Mover la corrección a `post_process`
+(stdin/stdout) lo elimina de raíz. Si alguna vez añades una orden que sobreviva
+al script, mándale stdout/stderr a `/dev/null` y usa `start_new_session=True`.
+Ver un `xclip` vivo en `ps` es normal: es el que sostiene el portapapeles.
 
 ## Uso
 
@@ -276,7 +289,7 @@ reemplazo.
 **Por eventos, no por sondeo.** Medido en este equipo: sondear cada 100 ms
 costaba 0,35% de CPU permanente; por eventos queda en 0,00%, con detección en
 13–44 ms. Sobre un portátil eso es batería a cambio de nada. Queda un sondeo
-de respaldo cada 2 s que cubre el arranque anterior a VoxType y rearma los
+de respaldo cada 1 s que cubre el arranque anterior a VoxType y rearma los
 monitores cuando su directorio aparece.
 
 **GTK3 del sistema, sin dependencias.** Es deliberado: este Python no tiene
@@ -284,7 +297,8 @@ el módulo `pip`, así que cualquier dependencia externa obligaría a montar un
 entorno virtual antes de poder ver nada en pantalla. PyGObject ya viene en
 Mint.
 
-**La ventana no intercepta clics** (región de entrada vacía). Es un
+**La ventana es click-through salvo los botones.** Solo la franja de
+Copiar/X en `Pegado` recibe clics; el resto de la tarjeta se atraviesa. Es un
 indicador, no un control.
 
 ## Tamaño y transparencia
@@ -303,14 +317,12 @@ systemctl --user restart indicador-voz
 
 ## Estado del proyecto
 
-Los cinco estados se dibujan, la integración con VoxType está probada de punta
-a punta y la corrección de transcripciones funciona. Lo que falta es lo que
-publica los estados desde el lado del agente:
+Los siete estados de la tabla se dibujan, la integración con VoxType está
+probada de punta a punta y la corrección de transcripciones funciona. Lo que
+falta es lo que publica los estados desde el lado del agente:
 
 - Hook `UserPromptSubmit` / `Stop` de Claude Code → `pensando` / `inactivo`
 - Plugin de OpenCode sobre `session.idle` → lo mismo
 - El script de TTS → `hablando` mientras lee
 
 Mientras tanto, `voz-estado` los publica a mano y sirve para probar.
-# voice-ia-transcription
-# voice-ia-transcription
