@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""
+Publica el estado del agente para que la tarjeta lo muestre.
+
+Lo llaman los hooks de Claude Code y el plugin de OpenCode:
+
+    voz-estado pensando    # el agente empezó a trabajar
+    voz-estado hablando    # el TTS está leyendo la respuesta
+    voz-estado inactivo    # terminó
+
+Sin argumentos imprime lo que se está mostrando ahora mismo, con su texto:
+es la forma rápida de comprobar si la cadena entera funciona.
+
+Los estados con texto (`recibido`, `corrigiendo`, `pegado`) los publican
+`corregir` y `pegar`, que sí llevan carga; esta orden solo cambia el estado.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import estado as st
+
+
+def main():
+    if len(sys.argv) == 1:
+        actual = st.estado_actual()
+        print(actual["estado"])
+        if actual["texto"]:
+            print(f'  texto:    {actual["texto"]}')
+        if actual["original"]:
+            print(f'  original: {actual["original"]}')
+        return 0
+
+    if len(sys.argv) != 2:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+
+    valor = sys.argv[1].strip().lower()
+    if valor in ("-h", "--help", "ayuda"):
+        print(__doc__.strip())
+        return 0
+
+    try:
+        st.escribir_propio(valor)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    except OSError as e:
+        # Nunca debe tumbar al agente: si el indicador no está, da igual.
+        print(f"no se pudo escribir el estado: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

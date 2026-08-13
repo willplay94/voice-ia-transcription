@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+Corrector para el hook `[output.post_process]` de VoxType.
+
+Recibe la transcripción por stdin y devuelve el texto corregido por stdout.
+VoxType lo llama antes de escribir el portapapeles, así que todo su flujo
+normal (portapapeles, pegado, restauración) sigue intacto.
+
+Esto sustituye al montaje anterior, que leía y escribía el portapapeles desde
+`post_output_command`. Aquel funcionaba, pero era frágil: `xclip` deja un hijo
+vivo que heredaba las tuberías de VoxType y le impedía dar por terminado el
+pegado. Por stdin no existe ese problema, y además VoxType ya trae su propio
+timeout y su propio respaldo al texto original.
+
+De paso publica el estado para la tarjeta: primero lo recibido, luego lo
+corregido.
+
+Uso directo, para probar:
+    echo "lo hice en Cloud IP con Boxed" | ./corregir
+"""
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import corrector
+import estado as st
+
+# "Recibido" y "Corrigiendo" se publican con menos de un milisegundo de
+# diferencia, así que la primera no llegaba a verse. Esta pausa la hace
+# legible sin retrasar el pegado de forma apreciable.
+PAUSA_RECIBIDO = 0.45
+
+
+def marcar(estado, texto="", original=""):
+    """Avisar a la tarjeta nunca debe estropear la corrección."""
+    try:
+        st.escribir_propio(estado, texto, original)
+    except (OSError, ValueError):
+        pass
+
+
+def main() -> int:
+    original = sys.stdin.read()
+    limpio = original.strip()
+
+    if not limpio:
+        sys.stdout.write(original)
+        return 0
+
+    # A partir de aquí, pase lo que pase, hay que escribir algo por stdout.
+    # Si este proceso muere sin escribir, se pierde el dictado entero.
+    final = limpio
+    try:
+        st.traza(f"corregir: entra ({len(limpio)} car.)")
+
+        # Lo recibido, tal cual llegó de Whisper. Se deja un momento en
+        # pantalla: si se pasa de golpe a "Corrigiendo", esta fase no se ve.
+        marcar(st.RECIBIDO, limpio)
+        time.sleep(PAUSA_RECIBIDO)
+
+        marcar(st.CORRIGIENDO, limpio)
+        final, motivo = corrector.corregir(limpio)
+        st.traza(f"corregir: {motivo}")
+
+        # Lo que va a pegarse, con el original al lado para poder resaltar
+        # los cambios en la tarjeta.
+        marcar(st.CORRIGIENDO, final, limpio)
+    except Exception as e:  # noqa: BLE001
+        st.traza(f"corregir: EXCEPCIÓN {e}")
+        print(f"corregir: {e}", file=sys.stderr)
+        final = limpio
+
+    st.traza("corregir: sale")
+    sys.stdout.write(final)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

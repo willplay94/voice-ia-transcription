@@ -1,0 +1,12 @@
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Config y metadatos de herramientas de agentes (no del proyecto)
+.opencode/
+opencode.json
+AGENTS.md
+CLAUDE.md
+
+# Demostración (binario pesado)
+demo.gif
