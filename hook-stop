@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+Hook `Stop` de Claude Code: lee la última respuesta del agente y la lee
+en voz alta con `hablar`.
+
+Fire-and-forget: lanza `hablar` despegado (start_new_session=True,
+stdout/stderr a /dev/null, texto por stdin) y sale en milisegundos. Si
+bloqueara durante la reproducción, Claude Code quedaría secuestrado en
+cada respuesta — es la lección del bug de xclip aplicada a los hooks del
+agente.
+
+Claude Code envía JSON por stdin con `last_assistant_message` (el texto de
+la respuesta) y `stop_hook_active` (para evitar re-dispararse).
+
+Este script vive en el repo y está referenciado por RUTA ABSOLUTA desde
+`~/.claude/settings.json`. Mover el directorio del proyecto rompe el hook,
+igual que rompe los hooks de VoxType (documentado en CLAUDE.md).
+
+Reglas que gobiernan el diseño, heredadas del resto del proyecto:
+
+  - Nunca tumbar a Claude Code: si el JSON es inválido, si falta
+    `last_assistant_message`, si stdin está vacío → salir con exit 0 sin
+    hacer nada. Un hook que lanza deja al agente sin responder.
+  - Nada de hijos que hereden tuberías: `hablar` se lanza con
+    `start_new_session=True` y stdout/stderr a /dev/null. El bug de `xclip`
+    (hijo vivo que heredaba las tuberías de VoxType y lo dejaba en
+    "transcribing" para siempre) es la lección que no se repite.
+  - NUNCA escribir el texto completo en traza.log: solo mensajes cortos
+    ("hook-stop: lanzando hablar (N car.)"). El texto dictado sale del
+    equipo y no debe quedar en un archivo de traza.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import estado as st
+
+# Umbral mínimo: no leer respuestas muy cortas. "ok", "listo", "hecho" no
+# aportan nada en voz alta y solo gastan una llamada de TTS.
+UMBRAL_MINIMO = 10
+
+# Cinturón: tope de caracteres que se le pasan a `hablar`. Las respuestas del
+# agente pueden llegar a decenas de miles de caracteres; `hablar` trunca de
+# todos modos (MAX_ENTRADA para el resumidor, max_caracteres para el TTS),
+# pero así ni siquiera se le entrega más de lo que puede usar. Antes el texto
+# iba por argv y ahí está el motivo real de este tope: el kernel limita un
+# argumento a 128 KiB (E2BIG) y, peor, el texto completo quedaba visible en
+# /proc/*/cmdline, legible por cualquier proceso del usuario.
+TOPE_TEXTO = 50_000
+
+
+def main() -> int:
+    # Leer el JSON de stdin. Si está vacío o es inválido, salir sin error:
+    # un hook que lanza deja a Claude Code sin responder.
+    try:
+        crudo = sys.stdin.read()
+    except (OSError, ValueError):
+        # ValueError: stdin ya cerrado. Nunca tumbar a Claude Code.
+        return 0
+
+    if not crudo.strip():
+        return 0
+
+    try:
+        payload = json.loads(crudo)
+    except json.JSONDecodeError:
+        st.traza("hook-stop: JSON inválido en stdin; se ignora")
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    # Anti-bucle: si stop_hook_active es true, el hook se está re-disparando
+    # porque un hook anterior devolvió decision:"block". No lanzar `hablar`
+    # otra vez, o se entra en bucle.
+    if payload.get("stop_hook_active"):
+        st.traza("hook-stop: stop_hook_active=true; no se lanza hablar")
+        return 0
+
+    texto = payload.get("last_assistant_message")
+    if not isinstance(texto, str):
+        return 0
+
+    limpio = texto.strip()
+    if not limpio:
+        return 0
+
+    # Umbral mínimo: no leer respuestas de una o dos palabras.
+    if len(limpio) < UMBRAL_MINIMO:
+        st.traza(f"hook-stop: respuesta corta ({len(limpio)} car.); no se lee")
+        return 0
+
+    # Lanzar `hablar` despegado. start_new_session=True y stdio a /dev/null:
+    # el hijo no hereda las tuberías de Claude Code y no lo deja colgado.
+    # No se espera a que termine: la reproducción puede durar 5-20s y
+    # bloquear aquí secuestraría al agente en cada respuesta.
+    #
+    # El texto entra por stdin y no por argv (hallazgo MEDIO de la revisión
+    # del TTS): en argv quedaba legible en /proc/*/cmdline — la respuesta del
+    # agente puede contener contenido de archivos o credenciales — y por
+    # encima de 128 KiB el exec fallaba con E2BIG y el TTS se perdía en
+    # silencio. `hablar` ya lee stdin cuando no recibe argumentos.
+    try:
+        p = subprocess.Popen(
+            [str(Path(__file__).resolve().parent / "hablar")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        st.traza(f"hook-stop: no se pudo lanzar hablar: {e}")
+        return 0
+
+    # communicate() NO vale aquí: escribe stdin y se queda ESPERANDO a que
+    # el hijo muera, así que este hook quedaba bloqueado durante toda la
+    # reproducción (resumen LLM + ElevenLabs + paplay: minutos) y
+    # secuestraba a Claude Code — justo lo que el fire-and-forget promete
+    # no hacer. Se escribe al pipe sin esperar: con el tope de 50K el texto
+    # cabe en el buffer del pipe (~64 KiB), así que el write no bloquea,
+    # `hablar` lo lee al arrancar (main() lee stdin antes de cualquier
+    # trabajo pesado) y este hook sale en milisegundos. Si el texto
+    # multibyte superara el buffer, el write solo esperaría a que `hablar`
+    # lea (milisegundos), nunca a que termine de hablar. Si `hablar` muriera
+    # antes de leer, el write lanza BrokenPipeError y se traga.
+    try:
+        p.stdin.write(limpio[:TOPE_TEXTO].encode("utf-8"))
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+    # Sin wait ni communicate: el hook sale en milisegundos.
+
+    # Solo el tamaño, nunca el texto: el contenido no debe quedar en la traza.
+    st.traza(f"hook-stop: lanzando hablar ({len(limpio)} car.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

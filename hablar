@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""
+Lee un texto en voz alta (TTS con ElevenLabs) y publica el estado "hablando".
+
+Flujo:
+    hablar [texto por stdin o argumento]
+    hablar --cortar    # mata la reproducción en curso y apaga la tarjeta
+
+El audio se genera con `tts.sintetizar()` (MP3 por trozos), se acumula en un
+tempfile y se reproduce con `paplay` (sin `--raw`). Si la síntesis falla
+(red, clave, HTTP), se cae a `spd-say` como respaldo.
+
+Reglas que gobiernan el diseño, heredadas del resto del proyecto:
+
+  - Nunca lanzar hacia afuera: todo va envuelto en try/except y los errores
+    acaban en la traza, no en la cara del usuario.
+  - Nada de hijos que hereden tuberías: `paplay` se lanza con
+    `start_new_session=True` y stdout/stderr a /dev/null. El bug de `xclip`
+    (hijo vivo que heredaba las tuberías de VoxType y lo dejaba en
+    "transcribing" para siempre) es la lección que no se repite.
+  - Solo el dueño del pidfile escribe INACTIVO: evita la carrera en el relevo
+    entre dos `hablar` seguidos.
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import corrector
+import estado as st
+import tts
+
+# Ruta absoluta de este script, para validar que un PID es realmente un
+# `hablar` y no un proceso cualquiera cuyo cmdline contenga "hablar" por
+# otras razones (vim hablar, grep hablar, etc.). El PID se reutiliza.
+RUTA_PROPIO = str(Path(__file__).resolve())
+
+# Flag global que el manejador de SIGTERM activa para que el finally de
+# reproducir() sepa que debe matar paplay inmediatamente, sin esperar al
+# wait(timeout=2) que haría el corte lento.
+_cortando = False
+
+# El pidfile vive en tmpfs, junto al resto del estado. Guarda el PID del
+# `hablar` que está reproduciendo ahora mismo, para poder cortarlo.
+PIDFILE = st.DIR_PROPIO / "hablar.pid"
+
+# Umbral para decidir si el texto es "corto y limpio" (directo) o no. Por
+# debajo de esto Y sin código/markdown se sintetiza tal cual, sin pasar por
+# el resumidor: ahorra ~0,7s de latencia y una llamada de pago.
+UMBRAL_CORTO = 200
+
+# Tope de caracteres que se mandan al resumidor. Las respuestas del agente
+# pueden tener 20-50K caracteres: mandarlas enteras hace el resumen lento,
+# caro y puede desbordar el contexto del modelo. Se trunca a cabeza + cola.
+MAX_ENTRADA = 4000
+
+# Tope del resumen resultante. Es lo que el TTS va a leer en voz alta, así
+# que conviene que quepa en una escucha cómoda.
+MAX_RESUMEN = 350
+
+# Latido: refresca el ts del estado HABLANDO para que no caduque por el TTL
+# de ESTADOS_EFIMEROS (15s) mientras un resumen largo sigue sonando.
+HEARTBEAT_S = 5.0
+
+# Cada cuánto se comprueba si VoxType empezó a grabar (para cortar el audio).
+SONDEO_CORTE_S = 0.25
+
+# Espera tras SIGTERM para que el proceso anterior limpie y muera.
+ESPERA_MUERTE_S = 0.2
+
+# Argumentos de paplay: sin --raw ni parámetros de formato. El plan Free de
+# ElevenLabs no devuelve PCM (pcm_44100 da HTTP 403), así que el audio llega
+# como MP3 y paplay lo decodifica solo a partir de la cabecera del archivo.
+# Por eso se reproduce desde un tempfile completo, no por stdin: paplay sin
+# --raw necesita la cabecera para detectar el formato, y con chunks a
+# cuentagotas por stdin la detección es frágil.
+PAPLAY = ["paplay"]
+
+
+def traza(mensaje: str) -> None:
+    """Atajo a st.traza, que ya se traga los errores de escritura."""
+    st.traza(mensaje)
+
+
+# --- Resumen con LLM (Fase 2) -------------------------------------------
+#
+# Las respuestas largas del agente no se pueden leer en voz alta tal cual:
+# tardarían minutos y arrastrarían código, rutas y URLs que el TTS leería
+# letra a letra. Aquí se resumen antes de sintetizar, reutilizando la
+# infraestructura de proveedores/claves/timeouts de `corrector.py` (mismo
+# dialecto OpenAI, mismas claves, mismo patrón urllib). No se usa
+# `corrector.corregir()`: eso corrige transcripciones, no resume.
+
+# Señales de que el modelo se puso a comentar en vez de resumir. Es el mismo
+# patrón que `corrector.FUGAS`, pero con las coletillas propias de un resumen
+# ("Aquí tienes el resumen", "Resumen:", etc.). Salió de la advertencia de
+# @review: un modelo con personalidad es más proclive a colar texto no
+# hablable, así que el prompt pide personalidad mínima y esta guarda descarta
+# lo que se cuele.
+FUGAS_RESUMEN = re.compile(
+    r"(?i)\b(wait\.|follow rules|as an ai|lo siento|aquí (?:está|tienes) (?:el|la)"
+    r"|resumen:|summary:|no puedo |no puedo resumir"
+    r"|por favor, (?:proporciona|dame|envía)"
+    r"|estoy listo para|estoy preparado para)",
+)
+
+
+def construir_prompt_resumen(max_caracteres: int) -> str:
+    """El system prompt del resumidor. 80% resumen técnico, 20% toque amable.
+
+    El usuario pidió un equilibrio: no un humorista, sino resúmenes técnicos
+    con un toque jocoso breve y amable, con acento colombiano. El chiste no
+    debe comer contexto ni alargar el resumen. Las guardas (FUGAS_RESUMEN,
+    normalización) siguen actuando como segunda barrera si el modelo se pasa
+    de gracioso.
+    """
+    return f"""Resumes la respuesta de un agente de IA para que la lea un TTS en voz alta.
+
+Personalidad: 80% resumen técnico fiel, 20% toque amable y jocoso. Un chiste
+breve o comentario gracioso al principio o al final, sin que domine el
+resumen. No seas humorista: sé un compañero técnico simpático, colombiano,
+amable. Usa expresiones naturales de Colombia (parcero, okey, qué chévere,
+ahí vamos) con moderación, sin exagerar.
+
+Reglas:
+1. Devuelve SOLO el resumen, sin prefijos ("Aquí tienes...", "Resumen:").
+2. Texto hablable: sin código, sin rutas de archivo, sin URLs, sin markdown, sin backticks.
+3. Conserva la información clave. No inventes nada que la respuesta no diga.
+4. Máximo {max_caracteres} caracteres.
+5. Si la respuesta ya es corta y hablable, devuélvela tal cual (con el toque amable).
+6. En español natural, frases cortas, fácil de escuchar."""
+
+
+def es_hablable(texto: str) -> bool:
+    """¿Se puede leer tal cual sin que suene mal? Sin código, URLs, rutas.
+
+    Es la primera barrera del camino corto: si el texto es corto Y hablable,
+    se sintetiza directo sin gastar una llamada de pago. Si tiene backticks,
+    URLs o pinta de ruta de archivo, se manda al resumidor aunque sea corto.
+    """
+    if "`" in texto:
+        return False
+    if "http" in texto.lower():
+        return False
+    if "```" in texto:
+        return False
+    # Rutas de archivo: /usr/bin, /home/..., ./algo
+    if re.search(r'(/[\w-]+){2,}|(\./[\w-]+)', texto):
+        return False
+    return True
+
+
+def normalizar_para_habla(texto: str) -> str:
+    """Limpia texto para que el TTS no lea código ni URLs.
+
+    Es la segunda barrera (el prompt es la primera): aunque el resumidor
+    devuelva algo con restos de markdown, aquí se limpia antes de sintetizar.
+    """
+    # Quitar bloques de código
+    texto = re.sub(r'```[\s\S]*?```', '', texto)
+    # Quitar backticks inline
+    texto = texto.replace('`', '')
+    # Quitar URLs
+    texto = re.sub(r'https?://\S+', '', texto)
+    # Quitar markdown de encabezados
+    texto = re.sub(r'^#+\s+', '', texto, flags=re.MULTILINE)
+    # Colapsar espacios
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    return texto
+
+
+def truncar_entrada(texto: str, max_chars: int = MAX_ENTRADA) -> str:
+    """Si el texto es muy largo, se queda con cabeza y cola unidas por ...
+
+    Las respuestas del agente pueden tener decenas de miles de caracteres.
+    Mandarlas enteras al resumidor es lento, caro y puede desbordar el
+    contexto. Cabeza y cola conservan el arranque (donde suele estar la
+    conclusión) y el cierre, que es lo que más pesa para resumir.
+    """
+    if len(texto) <= max_chars:
+        return texto
+    mitad = max_chars // 2
+    return texto[:mitad] + "\n\n[...contenido omitido...]\n\n" + texto[-mitad:]
+
+
+def es_resumen_valido(original: str, resumen: str, max_caracteres: int) -> tuple[bool, str]:
+    """¿Se puede usar este resumen? Ante la duda, no.
+
+    Guardas propias, NO `corrector.es_valida()`: aquella descarta respuestas
+    que acortan por debajo del 70% del original, y un resumen por definición
+    acorta, así que descartaría el 100% de los resúmenes.
+    """
+    if not resumen:
+        return False, "resumen vacío"
+    # Fugas: el modelo comentando en vez de resumir (mismo patrón que corrector.py)
+    if FUGAS_RESUMEN.search(resumen):
+        return False, "el modelo comentó en vez de resumir"
+    # No-vacío y no excesivamente largo
+    if len(resumen) > max_caracteres * 1.2:  # margen del 20%
+        return False, f"resumen demasiado largo ({len(resumen)} car.)"
+    # Debe ser más corto que el original (si no, no resumió)
+    if len(resumen) >= len(original):
+        # Pero si el original ya era corto, el "resumen" puede ser igual — eso es OK
+        if len(original) <= max_caracteres:
+            return True, ""
+        return False, "no acortó"
+    return True, ""
+
+
+def resumir(texto: str, config: dict) -> tuple[str, str]:
+    """Devuelve (texto_resumido, motivo). Nunca lanza.
+
+    Reutiliza la infra de `corrector.py` (proveedores, claves, timeouts,
+    patrón urllib). Si el LLM tarda o falla, se devuelve el texto original
+    truncado: el resumen NUNCA debe bloquear la reproducción.
+
+    Ojo con la colisión de claves: `config` es la config del TTS
+    (`hablar.json`), cuyo `"modelo"` es la voz de ElevenLabs
+    ("eleven_flash_v2_5"), NO un modelo de LLM. Mandar ese nombre a Ollama
+    Cloud devuelve HTTP 404. Por eso el proveedor/modelo/clave del resumidor
+    salen de `corrector.cargar_config()`, y de `config` solo se leen los
+    toggles propios del resumen (resumen_activo, topes de caracteres).
+    """
+    max_entrada = config.get("max_caracteres_entrada", MAX_ENTRADA)
+    max_resumen = config.get("max_caracteres_resumen", MAX_RESUMEN)
+    # Tope del TTS: si el resumen falla, el fallback no puede ser el texto
+    # íntegro (4799 car. → 110 s de spd-say con tarjeta apagada). Se trunca
+    # al máximo que el TTS acepta.
+    tope_tts = config.get("max_caracteres", 1000)
+
+    def _fallback_hablable(t: str) -> str:
+        """Trunca al tope del TTS para que el fallback no sea ilegible."""
+        return t[:tope_tts] if len(t) > tope_tts else t
+
+    if not config.get("resumen_activo", True):
+        return _fallback_hablable(texto), "resumen desactivado"
+
+    # Defensa en profundidad (hallazgo ALTO de la revisión del TTS): el kill
+    # switch de `main()` ya evita llegar aquí, pero `resumir` es la única
+    # puerta al LLM de pago y envía texto fuera del equipo. Si el TTS está
+    # desactivado, nada debe salir: ni síntesis ni resumen.
+    if not config.get("activo", False):
+        return _fallback_hablable(texto), "TTS desactivado"
+
+    limpio = texto.strip()
+    if not limpio:
+        return texto, "nada que resumir"
+
+    # Tope de entrada: no mandar 50K caracteres al modelo.
+    entrada = truncar_entrada(limpio, max_entrada)
+
+    # La config del LLM (proveedor, modelo, timeout) es la del corrector, no
+    # la del TTS: comparten proveedor y clave, y así no se pisa el "modelo".
+    config_llm = corrector.cargar_config()
+    proveedor = config_llm.get("proveedor", "ollama-cloud")
+    datos_proveedor = corrector.PROVEEDORES.get(proveedor)
+    if datos_proveedor is None:
+        return _fallback_hablable(texto), f"proveedor desconocido: {proveedor}"
+
+    clave = corrector.leer_clave(proveedor)
+    if not clave:
+        return _fallback_hablable(texto), f"sin clave de {proveedor}"
+
+    cuerpo = json.dumps({
+        "model": config_llm.get("modelo", "gemma4:31b"),
+        "messages": [
+            {"role": "system", "content": construir_prompt_resumen(max_resumen)},
+            {"role": "user", "content": entrada},
+        ],
+        "temperature": 0,
+        "max_tokens": 2000,
+    }).encode("utf-8")
+
+    peticion = urllib.request.Request(datos_proveedor["url"], data=cuerpo, headers={
+        "Authorization": f"Bearer {clave}",
+        "Content-Type": "application/json",
+        # OpenRouter los usa para atribuir el tráfico; Ollama los ignora.
+        "HTTP-Referer": "https://github.com/local/indicador-voz",
+        "X-Title": "indicador-voz",
+    })
+
+    try:
+        with urllib.request.urlopen(peticion, timeout=config_llm.get("timeout_s", 10)) as r:
+            datos = json.load(r)
+        resumen = (datos["choices"][0]["message"].get("content") or "").strip()
+    except urllib.error.HTTPError as e:
+        return _fallback_hablable(texto), f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return _fallback_hablable(texto), f"red: {e}"
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        return _fallback_hablable(texto), f"respuesta inesperada: {e}"
+
+    # Algunos modelos envuelven la respuesta en comillas pese a pedirles que no.
+    if len(resumen) > 1 and resumen[0] == resumen[-1] and resumen[0] in "\"'«":
+        resumen = resumen[1:-1].strip()
+
+    valido, motivo = es_resumen_valido(limpio, resumen, max_resumen)
+    if not valido:
+        return _fallback_hablable(texto), f"descartado: {motivo}"
+
+    return resumen, "resumido"
+
+
+def leer_pidfile() -> int | None:
+    """El PID del `hablar` en curso, o None si no hay o es ilegible."""
+    try:
+        return int(PIDFILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def proceso_es_hablar(pid: int) -> bool:
+    """¿Vive ese PID y su cmdline es este script?
+
+    El PID se reutiliza: un proceso muerto puede dejar su número a otro
+    proceso cualquiera. Comprobar que el cmdline resuelve a la ruta
+    absoluta de este script evita matar a un inocente (vim hablar, grep
+    hablar, etc.).
+
+    Resuelve cada argumento del cmdline contra el cwd del proceso (vía
+    /proc/PID/cwd) para que funcione también con invocación relativa
+    (./hablar) o por symlink. Path(__file__).resolve() ya resuelve
+    symlinks del propio script.
+    """
+    try:
+        partes = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+            "utf-8", "replace").split("\0")
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return False
+    for p in partes:
+        if not p or not p.endswith("hablar"):
+            continue
+        try:
+            if os.path.realpath(os.path.join(cwd, p)) == RUTA_PROPIO:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def matar_anterior() -> None:
+    """Si hay otro `hablar` reproduciendo, lo corta con SIGTERM.
+
+    SIGTERM y no SIGKILL: que el proceso anterior limpie (borre su pidfile,
+    apague su estado) antes de morir. SIGKILL lo dejaría a medias.
+
+    También silencia spd-say: matar al cliente spd-say no detiene lo que
+    speech-dispatcher ya encoló (es fire-and-forget). Sin esto, el audio
+    del proceso anterior seguiría sonando durante el relevo.
+    """
+    pid = leer_pidfile()
+    if pid is None or not proceso_es_hablar(pid):
+        return
+    traza(f"hablar: cortando anterior (pid {pid})")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    # Silenciar lo que speech-dispatcher tenga encolado del anterior.
+    try:
+        subprocess.run(
+            ["spd-say", "-S"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Espera breve a que muera, para no pisar su limpieza.
+    time.sleep(ESPERA_MUERTE_S)
+
+
+def escribir_pid() -> None:
+    """Deja mi PID en el pidfile, para que el próximo `hablar` me corte."""
+    try:
+        st.asegurar_directorio()
+        PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def borrar_pidfile() -> None:
+    """Borra el pidfile solo si sigue siendo mío (evita borrar el del relevo)."""
+    try:
+        if leer_pidfile() == os.getpid():
+            PIDFILE.unlink()
+    except OSError:
+        pass
+
+
+def apagar_si_soy_dueno() -> None:
+    """Escribe INACTIVO solo si el pidfile sigue conteniendo mi PID.
+
+    En el relevo entre dos `hablar`, el nuevo ya escribió su PID antes de que
+    el viejo termine. Si el viejo escribiera INACTIVO a ciegas, apagaría la
+    tarjeta mientras el nuevo ya está hablando. Solo el dueño apaga.
+    """
+    if leer_pidfile() == os.getpid():
+        try:
+            st.escribir_propio(st.INACTIVO)
+        except (OSError, ValueError):
+            pass
+
+
+def _al_sigterm(_signum, _marco):
+    """Convierte SIGTERM en SystemExit para que los finally limpien.
+
+    Python no convierte SIGTERM en excepción por defecto: la disposición por
+    defecto mata el proceso al instante, SIN ejecutar ningún finally. Eso
+    dejaba a paplay vivo (en sesión nueva, huérfano) tras un --cortar o un
+    relevo, sonando hasta el final del MP3. SystemExit SÍ recorre los finally.
+    """
+    global _cortando
+    _cortando = True
+    raise SystemExit(0)
+
+
+def fallback_spd_say(texto: str) -> bool:
+    """Respaldo: `spd-say -l es -w {texto}` si la síntesis falla.
+
+    Devuelve True si speech-dispatcher respondió. Puede auto-arrancar, así
+    que se le da un timeout generoso.
+
+    El `-w` (wait) es crucial: sin él, spd-say encola el texto y sale al
+    instante, dejando a `hablar` muerto mientras el audio sigue sonando.
+    Con `-w`, `hablar` se queda vivo bloqueado aquí, y el manejador de
+    SIGTERM puede interrumpirlo (SystemExit recorre los finally). El timeout
+    de subprocess es generoso (300s) porque un texto largo puede sonar
+    minutos: el corte real lo hace SIGTERM, no el timeout.
+
+    Hallazgo ALTO de la revisión del TTS: esto era un subprocess.run
+    bloqueante, así que durante un fallback largo ni se cortaba al empezar a
+    dictar ni había latido — la tarjeta caía por TTL con el audio sonando.
+    Hoy usa el mismo bucle de sondeo que `reproducir()`. Duplicado a
+    propósito: extraer un bucle común acoplaba dos formas de esperar (poll
+    de un Popen propio vs. bloqueo dentro de speech-dispatcher) y el
+    duplicado con comentario es más claro que una abstracción con banderas.
+    """
+    try:
+        spd = subprocess.Popen(
+            ["spd-say", "-l", "es", "-w", texto],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        traza(f"hablar: no se pudo lanzar spd-say: {e}")
+        return False
+
+    ultimo_heartbeat = time.time()
+    ultimo_sondeo = time.time()
+    cortado = False
+    try:
+        while spd.poll() is None:
+            ahora = time.time()
+            # Corte por grabación: igual que en reproducir(). Sin esto, el
+            # fallback hablaba encima del dictado del usuario.
+            if ahora - ultimo_sondeo >= SONDEO_CORTE_S:
+                ultimo_sondeo = ahora
+                if st.leer_voxtype() != st.INACTIVO:
+                    traza("hablar: corte por grabación (spd-say)")
+                    spd.terminate()
+                    cortado = True
+                    break
+            # Latido: el fallback también es "hablando" para la tarjeta.
+            if ahora - ultimo_heartbeat >= HEARTBEAT_S:
+                ultimo_heartbeat = ahora
+                try:
+                    st.actualizar_estado(st.HABLANDO)
+                except (OSError, ValueError):
+                    pass
+            time.sleep(SONDEO_CORTE_S)
+    finally:
+        # Si nos cortaron por SIGTERM (--cortar o relevo), matar spd-say YA:
+        # está en sesión nueva y sobrevive a la muerte del padre.
+        if _cortando and spd.poll() is None:
+            spd.terminate()
+        if spd.poll() is None:
+            try:
+                spd.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                spd.terminate()
+                try:
+                    spd.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    spd.kill()
+        # Matar al cliente no detiene lo que speech-dispatcher ya encoló
+        # (es fire-and-forget): hay que silenciarlo explícitamente, igual
+        # que hacen cortar() y matar_anterior().
+        if cortado or _cortando:
+            try:
+                subprocess.run(
+                    ["spd-say", "-S"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True, timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    return spd.returncode == 0
+
+
+def reproducir(texto: str, config: dict) -> bool:
+    """Reproduce `texto` con paplay, acumulando el MP3 en un tempfile.
+
+    Devuelve True si se reprodujo algo (o si se cortó por grabación), False
+    si no llegó audio (para caer a spd-say).
+
+    Dos fases: primero se descarga el MP3 completo a un tempfile, luego se
+    reproduce con `paplay <archivo>`. No se alimenta por stdin porque paplay
+    sin --raw necesita la cabecera del archivo para detectar el formato, y
+    con chunks a cuentagotas por stdin la detección es frágil.
+
+    Hallazgo MEDIO de la revisión del TTS (reproducido por QA): un SIGTERM
+    durante la fase 1 (descarga) salía sin borrar el MP3 — el unlink solo
+    cubría la fase 2 y los caminos normales. Ahora UN solo try/finally
+    rodea ambas fases y garantiza el borrado pase lo que pase.
+    """
+    try:
+        temporal = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    except OSError as e:
+        traza(f"hablar: no se pudo crear tempfile: {e}")
+        return False
+    ruta = temporal.name
+
+    hay_audio = False
+    cortado = False
+    ultimo_heartbeat = time.time()
+    ultimo_sondeo = time.time()
+
+    try:
+        # Fase 1: descargar el audio completo. El corte por grabación y el
+        # latido también corren aquí: una descarga larga puede coincidir con
+        # que el usuario empiece a dictar, y HABLANDO no debe caducar por TTL.
+        for trozo in tts.sintetizar(texto, config):
+            try:
+                temporal.write(trozo)
+                hay_audio = True
+            except OSError:
+                break
+
+            ahora = time.time()
+            if ahora - ultimo_sondeo >= SONDEO_CORTE_S:
+                ultimo_sondeo = ahora
+                if st.leer_voxtype() != st.INACTIVO:
+                    traza("hablar: corte por grabación (descarga)")
+                    cortado = True
+                    break
+            if ahora - ultimo_heartbeat >= HEARTBEAT_S:
+                ultimo_heartbeat = ahora
+                try:
+                    st.actualizar_estado(st.HABLANDO)
+                except (OSError, ValueError):
+                    pass
+
+        if cortado:
+            # El usuario empezó a grabar: no caer a spd-say, que hablaría
+            # encima. El finally de abajo borra el MP3.
+            return True
+
+        if not hay_audio:
+            # No llegó audio (red, clave, HTTP): caer a spd-say. El finally
+            # de abajo borra el MP3 (vacío o a medias).
+            return False
+
+        # Fase 2: reproducir el archivo completo.
+        paplay = None
+        try:
+            try:
+                paplay = subprocess.Popen(
+                    PAPLAY + [ruta],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                traza(f"hablar: no se pudo lanzar paplay: {e}")
+                return False
+
+            while paplay.poll() is None:
+                ahora = time.time()
+                # Corte por grabación: si VoxType empezó a grabar, se mata el
+                # audio. NO se silencia el micro, solo se corta la reproducción.
+                if ahora - ultimo_sondeo >= SONDEO_CORTE_S:
+                    ultimo_sondeo = ahora
+                    if st.leer_voxtype() != st.INACTIVO:
+                        traza("hablar: corte por grabación (reproducción)")
+                        paplay.terminate()
+                        break
+                # Latido: refresca el ts para que HABLANDO no caduque por TTL.
+                if ahora - ultimo_heartbeat >= HEARTBEAT_S:
+                    ultimo_heartbeat = ahora
+                    try:
+                        st.actualizar_estado(st.HABLANDO)
+                    except (OSError, ValueError):
+                        pass
+                time.sleep(SONDEO_CORTE_S)
+            return True
+        finally:
+            # Si nos cortaron por SIGTERM (--cortar o relevo), matar paplay
+            # YA: sin esto el audio seguiría sonando hasta el final del MP3
+            # porque paplay está en sesión nueva y sobrevive a la muerte del
+            # padre. Y esperar con timeout, para no dejar un hijo vivo
+            # heredando tuberías (la lección del bug de xclip).
+            if _cortando and paplay is not None and paplay.poll() is None:
+                paplay.terminate()
+            if paplay is not None:
+                try:
+                    paplay.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    paplay.terminate()
+                    try:
+                        paplay.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        paplay.kill()
+    finally:
+        # Cerrar el temporal (fase 1) y limpiar el tempfile SIEMPRE, en las
+        # dos fases y en cualquier salida: normal, corte por grabación o
+        # SystemExit de un SIGTERM (--cortar o relevo). Sin este finally
+        # único, cada corte durante la descarga dejaba un .mp3 huérfano en
+        # /tmp.
+        try:
+            temporal.close()
+        except OSError:
+            pass
+        try:
+            Path(ruta).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def cortar() -> int:
+    """Modo --cortar: mata la reproducción en curso y apaga la tarjeta.
+
+    Sale en milisegundos: es lo que el usuario engancha a un atajo.
+
+    Silencia tanto el audio de paplay (vía SIGTERM al proceso `hablar` que
+    lo controla) como el de spd-say (vía `spd-say -S`, que detiene lo que
+    speech-dispatcher tenga encolado). Sin el `-S`, el fallback de spd-say
+    seguiría sonando porque es fire-and-forget: el proceso `hablar` ya murió
+    pero el daemon de speech-dispatcher sigue hablando.
+    """
+    pid = leer_pidfile()
+    if pid is not None and proceso_es_hablar(pid):
+        traza(f"hablar --cortar: matando pid {pid}")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        # Apagar la tarjeta y borrar el pidfile SOLO si el pidfile sigue
+        # siendo el PID que acabamos de matar (hallazgo MEDIO de la revisión
+        # del TTS). Antes se hacía incondicionalmente: si entre leer el
+        # pidfile y matar hubo un relevo, el nuevo `hablar` ya escribió su
+        # PID y estaba hablando — y este INACTIVO lo apagaba y este unlink
+        # le borraba su pidfile, dejándolo sin dueño. Mismo patrón que
+        # apagar_si_soy_dueno(): solo el dueño toca.
+        if leer_pidfile() == pid:
+            try:
+                st.escribir_propio(st.INACTIVO)
+            except (OSError, ValueError):
+                pass
+            try:
+                PIDFILE.unlink()
+            except OSError:
+                pass
+    # Silenciar spd-say si estaba sonando como fallback. Fuera del if: el
+    # audio de speech-dispatcher no depende del pidfile.
+    try:
+        subprocess.run(
+            ["spd-say", "-S"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
+def main() -> int:
+    # Sin esto, SIGTERM mata el proceso sin ejecutar los finally: paplay
+    # (en sesión nueva) sobreviviría y seguiría sonando tras un --cortar o
+    # un relevo. SystemExit SÍ recorre los finally. SIGHUP (terminal que se
+    # cierra) tiene el mismo problema y la misma solución.
+    signal.signal(signal.SIGTERM, _al_sigterm)
+    signal.signal(signal.SIGHUP, _al_sigterm)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--cortar":
+        return cortar()
+
+    # Texto por argumento o por stdin. El camino stdin es el que usa
+    # hook-stop: el texto por argv quedaba visible en /proc/*/cmdline y
+    # respuestas >128 KiB reventaban el exec con E2BIG.
+    if len(sys.argv) > 1:
+        texto = " ".join(sys.argv[1:])
+    else:
+        texto = sys.stdin.read()
+
+    limpio = texto.strip()
+    if not limpio:
+        return 0
+
+    traza("hablar: entra")
+
+    try:
+        matar_anterior()
+        escribir_pid()
+
+        config = tts.cargar_config()
+
+        # Kill switch ANTES de nada (hallazgo ALTO de la revisión del TTS):
+        # con "activo": false no se resume, no se sintetiza, no se publica
+        # HABLANDO y no suena ni el fallback. Antes solo `tts.sintetizar`
+        # miraba esta clave, así que un TTS desactivado seguía llamando al
+        # LLM resumidor (de pago, y manda texto fuera del equipo) y luego
+        # hablaba por spd-say: exactamente lo que el switch promete cortar.
+        if not config.get("activo", False):
+            traza("hablar: desactivado en hablar.json")
+            return 0
+
+        # Cinturón y tirantes (patrón de corregir): el valor por defecto es
+        # el texto original, que siempre se puede hablar. Si `resumir`
+        # lanza una excepción no prevista, `texto_habla` ya tiene valor y
+        # la reproducción no se pierde en silencio.
+        texto_habla = limpio
+
+        # Decidir camino: corto y limpio → directo; si no → resumir con LLM.
+        es_corto = len(limpio) < config.get("umbral_corto", UMBRAL_CORTO)
+        es_limpio = es_hablable(limpio)
+
+        if es_corto and es_limpio:
+            # Camino corto: directo, sin LLM. Ahorra ~0,7s y una llamada de pago.
+            traza(f"hablar: corto y limpio ({len(limpio)} car.)")
+            texto_habla = limpio
+        else:
+            # Camino largo: resumir con LLM. Si el resumidor falla o tarda,
+            # `resumir` devuelve el original truncado, así que nunca se
+            # bloquea la reproducción.
+            traza(f"hablar: largo o con código ({len(limpio)} car.) → resumiendo")
+            try:
+                texto_habla, motivo = resumir(limpio, config)
+                traza(f"hablar: resumen {motivo} ({len(texto_habla)} car.)")
+            except Exception as e:  # noqa: BLE001
+                traza(f"hablar: resumidor lanzó {e}; se usa el original")
+            texto_habla = normalizar_para_habla(texto_habla)
+
+        # Publicar HABLANDO con el texto, para que la tarjeta lo muestre.
+        try:
+            st.escribir_propio(st.HABLANDO, texto=texto_habla)
+        except (OSError, ValueError):
+            pass
+
+        reproducido = reproducir(texto_habla, config)
+
+        if not reproducido:
+            traza("hablar: fallback spd-say")
+            if not fallback_spd_say(texto_habla):
+                traza("hablar: spd-say tampoco respondió")
+    except Exception as e:  # noqa: BLE001
+        traza(f"hablar: EXCEPCIÓN {e}")
+    finally:
+        apagar_si_soy_dueno()
+        borrar_pidfile()
+        traza("hablar: sale")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -103,7 +103,10 @@ def main() -> int:
     )
     if fresco and propio["texto"]:
         previo = leer_clipboard()
-        st.traza(f"pegar: clipboard antes = {previo[:60]!r}" if previo is not None
+        # Solo la longitud, nunca el contenido (hallazgo BAJO de la revisión
+        # del TTS): aquí el portapapeles contiene texto dictado, que sale del
+        # equipo y no debe acabar en un archivo de traza.
+        st.traza(f"pegar: clipboard antes = {len(previo)} car." if previo is not None
                  else "pegar: clipboard antes = <ilegible: xclip sin DISPLAY?>")
         if escribir_clipboard(propio["texto"]):
             st.traza("pegar: portapapeles reescrito con el texto propio")
