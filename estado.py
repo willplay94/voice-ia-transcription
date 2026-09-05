@@ -55,7 +55,11 @@ ESTADOS_PROPIOS = {RECIBIDO, CORRIGIENDO, PEGADO, PENSANDO, HABLANDO, INACTIVO}
 # PEGADO dura 10s (no 5s) porque la tarjeta en ese estado muestra botones
 # interactivos (Copiar y X): hace falta tiempo para leer el texto, decidir y
 # acertar el botón. El hover de la UI pausa el auto-cierre como complemento.
-ESTADOS_EFIMEROS = {PEGADO: 10.0, RECIBIDO: 12.0}
+# HABLANDO dura 15s: si `hablar` muere (OOM, kill, crash de paplay), nadie
+# apaga HABLANDO y la tarjeta queda clavada. El TTL es generoso porque un
+# resumen puede sonar ~1 min, pero `hablar` refresca el ts cada 5s (heartbeat):
+# proceso vivo → no caduca; proceso muerto → caduca solo.
+ESTADOS_EFIMEROS = {PEGADO: 10.0, RECIBIDO: 12.0, HABLANDO: 15.0}
 
 _MAPA_VOXTYPE = {
     "idle": INACTIVO,

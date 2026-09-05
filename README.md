@@ -93,6 +93,9 @@ funcionaban y el que tardaba 11 s era el modelo.
 | `corrector.py` | Manda la transcripción a un LLM para que la repase. |
 | `corregir` | Hook `post_process` de VoxType: stdin → stdout. |
 | `pegar` | Hook `post_output_command`: pulsa Ctrl+Shift+V y marca "Pegado". |
+| `tts.py` | Llama a ElevenLabs por REST (`urllib`) para sintetizar voz. |
+| `hablar` | Resume si es largo, sintetiza con ElevenLabs, reproduce y publica `hablando`. |
+| `hook-stop` | Hook `Stop` de Claude Code: lanza `hablar` despegado (fire-and-forget). |
 
 El servicio systemd y los hooks se configuran fuera del repo, referenciados
 por rutas absolutas desde `~/.config/systemd/user/indicador-voz.service` y
@@ -234,6 +237,48 @@ echo "lo hice en Cloud IP con Boxed" | ./corregir
 por defecto). Si dictas algo que no deba salir del equipo, pon `"activo":
 false`.
 
+## Lectura de respuestas en voz alta (TTS)
+
+Cuando el agente termina de responder, un hook `Stop` de Claude Code lanza
+`hablar`, que resume la respuesta (si es larga), la sintetiza con ElevenLabs
+y la reproduce por el altavoz. La tarjeta muestra "Claude hablando" mientras
+suele.
+
+```
+Claude responde → hook Stop → hablar → resumir (LLM) → sintetizar (ElevenLabs) → paplay
+```
+
+- **Motor**: ElevenLabs por API REST directa (`urllib`, sin SDK — respeta la
+  restricción sin-pip). Modelo `eleven_flash_v2_5` (latencia ~75ms,
+  $0.05/1K chars). Voz por defecto en el código: Carlos Aguilar
+  (`8MeTTgXVwMEhRVfblXOj`), que es de la **librería y requiere plan de
+  pago** — en plan Free devuelve HTTP 402 y el TTS cae a `spd-say`. La voz
+  predefinida de Free es **Adam** (`pNInz6obpgDQGcFmaJgB`), que es la que
+  trae el `hablar.json` de la máquina de uso diario; si montas desde cero
+  con plan Free, pon esa en tu config.
+- **Resumen**: respuestas largas se resumen con el mismo LLM del corrector
+  (`gemma4:31b` por Ollama Cloud). Personalidad 80% técnica, 20% amable y
+  jocosa, colombiana. Máximo 350 caracteres. Las respuestas cortas (<200
+  chars) y limpias (sin código) se leen directo sin resumir.
+- **Corte**: si empiezas a dictar mientras suena, el audio se corta solo
+  (sondea el estado de VoxType cada 250ms). También `hablar --cortar`
+  silencia al instante.
+- **Fallback**: si ElevenLabs falla (red, clave, HTTP), cae a `spd-say`
+  (voz robótica local, sin coste).
+- **Config**: `~/.config/indicador-voz/hablar.json` (permisos 0600) con
+  `api_key`, `voz_id`, `modelo`, `activo` (false por defecto).
+
+**Aviso de privacidad:** las respuestas del agente salen del equipo hacia
+ElevenLabs (síntesis) y hacia el LLM resumidor (Ollama Cloud). Pueden
+contener contenido de archivos, credenciales o datos sensibles. Si no
+quieres que salgan, pon `"activo": false` en `hablar.json`.
+
+### Hook de Claude Code
+
+El hook `Stop` está en `~/.claude/settings.json` y apunta a `hook-stop` por
+ruta absoluta. Es fire-and-forget: lanza `hablar` despegado y sale en
+milisegundos, sin bloquear a Claude Code.
+
 ### La trampa de xclip (histórica, pero no la repitas)
 
 El montaje anterior usaba `xclip` desde `post_output_command`. `xclip` deja un
@@ -318,11 +363,14 @@ systemctl --user restart indicador-voz
 ## Estado del proyecto
 
 Los siete estados de la tabla se dibujan, la integración con VoxType está
-probada de punta a punta y la corrección de transcripciones funciona. Lo que
-falta es lo que publica los estados desde el lado del agente:
+probada de punta a punta, la corrección de transcripciones funciona, y el
+TTS con ElevenLabs está implementado y enganchado a Claude Code. Lo que
+falta:
 
-- Hook `UserPromptSubmit` / `Stop` de Claude Code → `pensando` / `inactivo`
-- Plugin de OpenCode sobre `session.idle` → lo mismo
-- El script de TTS → `hablando` mientras lee
+- Plugin de OpenCode sobre `session.idle` → `hablando` / `inactivo`
+- Revisión de @security sobre la superficie de privacidad del TTS
+- Streaming de MP3 para reducir latencia (reproducir antes de tener el
+  archivo completo)
+- Mejorar la interfaz gráfica (distinguir Claude vs OpenCode)
 
-Mientras tanto, `voz-estado` los publica a mano y sirve para probar.
+Mientras tanto, `voz-estado` publica los estados a mano y sirve para probar.
