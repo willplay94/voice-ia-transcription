@@ -4,7 +4,10 @@ Lee un texto en voz alta (TTS con ElevenLabs) y publica el estado "hablando".
 
 Flujo:
     hablar [texto por stdin o argumento]
+    hablar --origen <slug> [texto por stdin]    # quién pide la lectura
     hablar --cortar    # mata la reproducción en curso y apaga la tarjeta
+    hablar --voz <origen> on|off    # silencia/activa la voz de un agente
+    hablar --voz                    # imprime el estado de todos los orígenes
 
 El audio se genera con `tts.sintetizar()` (MP3 por trozos), se acumula en un
 tempfile y se reproduce con `paplay` (sin `--raw`). Si la síntesis falla
@@ -20,6 +23,11 @@ Reglas que gobiernan el diseño, heredadas del resto del proyecto:
     "transcribing" para siempre) es la lección que no se repite.
   - Solo el dueño del pidfile escribe INACTIVO: evita la carrera en el relevo
     entre dos `hablar` seguidos.
+  - El interruptor por agente (`voz_por_origen`) se comprueba ANTES de
+    `resumir()`, en el mismo punto del kill switch `activo`: silenciar solo
+    el audio no vale, porque para entonces ya se pagó el resumen y la
+    respuesta del agente ya salió a la nube (hallazgo ALTO de la revisión
+    del TTS, aplicado al interruptor nuevo).
 """
 
 import json
@@ -53,6 +61,10 @@ _cortando = False
 # El pidfile vive en tmpfs, junto al resto del estado. Guarda el PID del
 # `hablar` que está reproduciendo ahora mismo, para poder cortarlo.
 PIDFILE = st.DIR_PROPIO / "hablar.pid"
+
+# Config del TTS: `tts.py` la define, pero `--voz` escribe en ella y `main`
+# la lee. Aquí solo la ruta, para no duplicar la constante.
+CONFIG_TTS = tts.CONFIG
 
 # Umbral para decidir si el texto es "corto y limpio" (directo) o no. Por
 # debajo de esto Y sin código/markdown se sintetiza tal cual, sin pasar por
@@ -90,6 +102,119 @@ PAPLAY = ["paplay"]
 def traza(mensaje: str) -> None:
     """Atajo a st.traza, que ya se traga los errores de escritura."""
     st.traza(mensaje)
+
+
+# --- Interruptor de voz por agente (voz_por_origen) ----------------------
+#
+# Hoy el único interruptor es "activo" en hablar.json, y es global: mata el
+# TTS de todo. Con `origen` en circulación (plan v3 §9) se puede decir "lee
+# OpenCode pero a Claude no". Es un diccionario ABIERTO, no dos banderas:
+# un origen ausente se trata como true, así que un agente nuevo habla desde
+# el primer día y se puede callar añadiendo su clave. "activo": false sigue
+# siendo el interruptor maestro y manda sobre todo lo demás: significa "no
+# sale nada del equipo" (hallazgo de la revisión de seguridad del TTS) y no
+# se debilita.
+
+
+def voz_habilitada(origen: str, config: dict) -> bool:
+    """¿Este origen tiene permiso de hablar? Nunca lanza.
+
+    Origen vacío (el de hoy, sin campo) → true: regresión bit a bit para
+    quien no toque nada. Origen ausente del diccionario → true: un agente
+    nuevo habla desde el día uno. Solo una clave explícita en false calla.
+    """
+    if not origen:
+        return True
+    por_origen = config.get("voz_por_origen")
+    if not isinstance(por_origen, dict):
+        return True
+    return por_origen.get(origen, True) is not False
+
+
+def cargar_config_tts() -> dict:
+    """Config del TTS tolerante a archivo ausente o ilegible.
+
+    `tts.cargar_config()` ya fusiona sobre POR_DEFECTO y traga errores, pero
+    devuelve {} si el archivo no existe (FileNotFoundError → pass sobre un
+    dict vacío, no sobre POR_DEFECTO). Para `--voz` hace falta la base
+    completa: si se escribiera solo {"voz_por_origen": ...} se perderían
+    api_key y voz_id. Por eso se fusiona aquí de nuevo.
+    """
+    config = dict(tts.POR_DEFECTO)
+    try:
+        config.update(json.loads(CONFIG_TTS.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        traza(f"hablar: config ilegible ({e}); se usan los valores por defecto")
+    return config
+
+
+def escribir_config_tts(config: dict) -> bool:
+    """Escribe la config del TTS de forma atómica, preservando permisos.
+
+    Devuelve True si escribió. Escritura a .tmp y rename: la misma razón que
+    `escribir_propio()` — nadie debe pillar un hablar.json a medias. Los
+    permisos 0600 se restauran a mano porque rename los pierde: el archivo
+    guarda la api_key de ElevenLabs y no puede acabar legible para todos.
+    """
+    try:
+        CONFIG_TTS.parent.mkdir(parents=True, exist_ok=True)
+        temporal = CONFIG_TTS.with_suffix(".tmp")
+        temporal.write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(temporal, 0o600)
+        except OSError:
+            pass
+        temporal.replace(CONFIG_TTS)
+        return True
+    except OSError as e:
+        traza(f"hablar: no se pudo escribir {CONFIG_TTS}: {e}")
+        return False
+
+
+def modo_voz(argv: list) -> int:
+    """Modo `hablar --voz`: consulta o cambia voz_por_origen en hablar.json.
+
+    `--voz` sin más argumentos imprime el estado de todos los orígenes
+    presentes en la config. `--voz <origen> on|off` escribe; cualquier slug
+    válido sirve (diccionario abierto, plan v3 §10). Nunca toca el pidfile
+    ni el estado: es una orden de configuración, no una reproducción.
+    """
+    config = cargar_config_tts()
+    por_origen = config.get("voz_por_origen")
+    if not isinstance(por_origen, dict):
+        por_origen = {}
+
+    if len(argv) == 1:
+        # Consulta: solo los orígenes presentes en la config.
+        if not por_origen:
+            print("voz_por_origen: sin claves (todos los orígenes hablan)")
+            return 0
+        for origen, valor in sorted(por_origen.items()):
+            estado_voz = "on" if valor else "off"
+            print(f"{origen}: {estado_voz}")
+        return 0
+
+    origen = argv[1].strip().lower()
+    if not st.ORIGEN_VALIDO.match(origen):
+        print(f"origen inválido: {origen!r} (usa letras minúsculas, números y guiones)", file=sys.stderr)
+        return 2
+    if len(argv) < 3 or argv[2].lower() not in ("on", "off"):
+        print("uso: hablar --voz <origen> on|off", file=sys.stderr)
+        return 2
+
+    nuevo = argv[2].lower() == "on"
+    por_origen[origen] = nuevo
+    config["voz_por_origen"] = por_origen
+    if escribir_config_tts(config):
+        traza(f"hablar --voz: {origen} -> {'on' if nuevo else 'off'}")
+        print(f"{origen}: {'on' if nuevo else 'off'}")
+        return 0
+    return 1
 
 
 # --- Resumen con LLM (Fase 2) -------------------------------------------
@@ -696,11 +821,31 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--cortar":
         return cortar()
 
+    if len(sys.argv) > 1 and sys.argv[1] == "--voz":
+        return modo_voz(sys.argv[1:])
+
+    # --origen <slug>: quién pide la lectura. Va antes del texto para no
+    # confundirse con él. Sin flag → cadena vacía: el comportamiento de hoy
+    # intacto (hook-stop sin cambios, pruebas a mano, etc.).
+    origen = ""
+    resto = sys.argv[1:]
+    if resto and resto[0] == "--origen":
+        if len(resto) < 2 or not resto[1].strip():
+            print("uso: hablar --origen <slug> [texto]", file=sys.stderr)
+            return 2
+        origen = resto[1].strip().lower()
+        if not st.ORIGEN_VALIDO.match(origen):
+            # Misma política que voz-estado: forma, no pertenencia. Un slug
+            # inválido no lanza: se apunta y se trata como sin origen.
+            st.traza(f"hablar: origen inválido {origen!r}; se ignora")
+            origen = ""
+        resto = resto[2:]
+
     # Texto por argumento o por stdin. El camino stdin es el que usa
     # hook-stop: el texto por argv quedaba visible en /proc/*/cmdline y
     # respuestas >128 KiB reventaban el exec con E2BIG.
-    if len(sys.argv) > 1:
-        texto = " ".join(sys.argv[1:])
+    if resto:
+        texto = " ".join(resto)
     else:
         texto = sys.stdin.read()
 
@@ -724,6 +869,15 @@ def main() -> int:
         # hablaba por spd-say: exactamente lo que el switch promete cortar.
         if not config.get("activo", False):
             traza("hablar: desactivado en hablar.json")
+            return 0
+
+        # Interruptor por agente, en el MISMO punto que el kill switch y
+        # ANTES de resumir() (plan v3 §9): silenciar después del resumen no
+        # vale, porque para entonces ya se pagó la llamada y la respuesta
+        # del agente ya salió a la nube. Origen vacío → voz_habilitada da
+        # true, así que el camino de hoy no cambia ni un bit.
+        if not voz_habilitada(origen, config):
+            traza(f"hablar: voz desactivada para origen {origen!r}; no se resume ni sintetiza")
             return 0
 
         # Cinturón y tirantes (patrón de corregir): el valor por defecto es
@@ -752,9 +906,10 @@ def main() -> int:
                 traza(f"hablar: resumidor lanzó {e}; se usa el original")
             texto_habla = normalizar_para_habla(texto_habla)
 
-        # Publicar HABLANDO con el texto, para que la tarjeta lo muestre.
+        # Publicar HABLANDO con el texto y el origen, para que la tarjeta
+        # distinga quién habla. El origen vacío escribe "" igual que antes.
         try:
-            st.escribir_propio(st.HABLANDO, texto=texto_habla)
+            st.escribir_propio(st.HABLANDO, texto=texto_habla, origen=origen)
         except (OSError, ValueError):
             pass
 

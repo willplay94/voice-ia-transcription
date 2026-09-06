@@ -17,6 +17,7 @@ mañana cambia el motor de voz o el agente, la UI no se entera.
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -68,6 +69,12 @@ _MAPA_VOXTYPE = {
     "processing": TRANSCRIBIENDO,
 }
 
+# El origen es un slug abierto, no un enum cerrado: mañana puede haber Cursor
+# CLI, Codex u otro agente, y cerrar "claude|opencode" en una lista sale barato
+# ahora y caro después (plan v3 §10). Se valida la FORMA, nunca la pertenencia:
+# lo que no encaje se ignora (sin romper nada), no se rechaza con error.
+ORIGEN_VALIDO = re.compile(r"^[a-z0-9-]{1,20}$")
+
 
 ARCHIVO_TRAZA = DIR_PROPIO / "traza.log"
 
@@ -106,8 +113,8 @@ def leer_voxtype() -> str:
 
 
 def leer_propio() -> dict:
-    """El estado propio con su carga: {estado, texto, original, ts}."""
-    vacio = {"estado": INACTIVO, "texto": "", "original": "", "ts": 0.0}
+    """El estado propio con su carga: {estado, texto, original, ts, origen}."""
+    vacio = {"estado": INACTIVO, "texto": "", "original": "", "ts": 0.0, "origen": ""}
     try:
         datos = json.loads(ARCHIVO_AGENTE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -126,20 +133,41 @@ def leer_propio() -> dict:
         "texto": str(datos.get("texto") or ""),
         "original": str(datos.get("original") or ""),
         "ts": float(datos.get("ts") or 0),
+        # .get con respaldo y no por índice: un agente.json escrito por una
+        # versión anterior no lleva "origen" y no debe romper la lectura
+        # (plan v3 §8). Se transporta intacto: `actualizar_estado()` (que
+        # llaman `pegar` y el latido de `reproducir()`) lo conserva solo si
+        # la lectura lo devuelve.
+        "origen": str(datos.get("origen") or ""),
     }
 
 
-def escribir_propio(estado: str, texto: str = "", original: str = "") -> None:
+def escribir_propio(estado: str, texto: str = "", original: str = "",
+                    origen: str = "") -> None:
     """Publica estado y texto.
 
     Escribe a un temporal y renombra, porque `rename` es atómico: la UI lee
     esto constantemente y así nunca pilla una escritura a medias.
+
+    `origen` es opcional y por defecto vacío: los callers que no lo pasan
+    (corregir, pegar, voz-estado sin 2º argumento) escriben exactamente lo
+    mismo que antes — regresión bit a bit.
     """
     if estado not in ESTADOS_PROPIOS:
         raise ValueError(f"estado desconocido: {estado!r} (usa: {sorted(ESTADOS_PROPIOS)})")
 
+    # Validación de forma, no de pertenencia (plan v3 §10): un slug raro
+    # ("Cursor CLI!") no se rechaza con excepción — se normaliza a vacío y
+    # queda en la traza. Un ValueError aquí tumbaría al publicador, y un
+    # origen inválido nunca vale una tarjeta rota.
+    origen = str(origen or "")
+    if origen and not ORIGEN_VALIDO.match(origen):
+        traza(f"estado: origen inválido {origen!r}; se ignora")
+        origen = ""
+
     asegurar_directorio()
-    datos = {"estado": estado, "texto": texto, "original": original, "ts": time.time()}
+    datos = {"estado": estado, "texto": texto, "original": original,
+             "ts": time.time(), "origen": origen}
     temporal = ARCHIVO_AGENTE.with_suffix(".tmp")
     temporal.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
     temporal.replace(ARCHIVO_AGENTE)
@@ -150,18 +178,28 @@ def actualizar_estado(estado: str) -> None:
 
     Lo usa el paso de pegado: el texto y su original los publicó el corrector
     un momento antes, y aquí solo se marca que ya está pegado.
+
+    Este es el sitio exacto donde `origen` se perdería si nadie lo cuida
+    (plan v3 §8): lo llaman `pegar` y el latido de `reproducir()` cada 5 s,
+    y ambos llaman sin kwarg. La conservación sale de `leer_propio()`, que
+    ahora transporta el campo.
     """
     previo = leer_propio()
-    escribir_propio(estado, previo["texto"], previo["original"])
+    escribir_propio(estado, previo["texto"], previo["original"],
+                    previo.get("origen", ""))
 
 
 def estado_actual() -> dict:
-    """Lo que toca mostrar: {estado, texto, original}, resuelto por prioridad."""
+    """Lo que toca mostrar: {estado, texto, original, origen}, resuelto por prioridad."""
     propio = leer_propio()
     candidatos = {leer_voxtype(), propio["estado"]}
     for estado in PRIORIDAD:
         if estado in candidatos:
             if estado == propio["estado"]:
                 return propio
-            return {"estado": estado, "texto": "", "original": "", "ts": 0.0}
-    return {"estado": INACTIVO, "texto": "", "original": "", "ts": 0.0}
+            # Rama de VoxType: sin carga propia. `origen` vacío a propósito —
+            # grabando/transcribiendo no tienen agente detrás.
+            return {"estado": estado, "texto": "", "original": "", "ts": 0.0,
+                    "origen": ""}
+    return {"estado": INACTIVO, "texto": "", "original": "", "ts": 0.0,
+            "origen": ""}

@@ -7,12 +7,19 @@ Lo llaman los hooks de Claude Code y el plugin de OpenCode:
     voz-estado pensando    # el agente empezó a trabajar
     voz-estado hablando    # el TTS está leyendo la respuesta
     voz-estado inactivo    # terminó
+    voz-estado pensando claude    # con origen: quién lo publica
+    voz-estado hablando opencode
 
 Sin argumentos imprime lo que se está mostrando ahora mismo, con su texto:
 es la forma rápida de comprobar si la cadena entera funciona.
 
 Los estados con texto (`recibido`, `corrigiendo`, `pegado`) los publican
 `corregir` y `pegar`, que sí llevan carga; esta orden solo cambia el estado.
+
+El origen es un slug abierto (`^[a-z0-9-]{1,20}$`), no un enum cerrado:
+mañana puede haber Cursor CLI u otro agente, y la pertenencia a una lista
+obligaría a tocar código para cada uno (plan v3 §10). Lo que no encaje en la
+forma va a la traza y se ignora, sin romper nada.
 """
 
 import sys
@@ -33,7 +40,7 @@ def main():
             print(f'  original: {actual["original"]}')
         return 0
 
-    if len(sys.argv) != 2:
+    if len(sys.argv) > 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
 
@@ -42,8 +49,20 @@ def main():
         print(__doc__.strip())
         return 0
 
+    # Origen opcional (2º argumento). Sin él, cadena vacía: comportamiento
+    # idéntico al de antes de existir el campo.
+    origen = ""
+    if len(sys.argv) == 3:
+        origen = sys.argv[2].strip().lower()
+        if origen and not st.ORIGEN_VALIDO.match(origen):
+            # Validación de forma, no de pertenencia: un slug inválido no
+            # tumba la publicación (el estado sin origen sigue siendo útil),
+            # solo se apunta en la traza y se descarta el campo.
+            st.traza(f"voz-estado: origen inválido {origen!r}; se ignora")
+            origen = ""
+
     try:
-        st.escribir_propio(valor)
+        st.escribir_propio(valor, origen=origen)
     except ValueError as e:
         print(e, file=sys.stderr)
         return 2

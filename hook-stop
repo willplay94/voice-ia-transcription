@@ -99,6 +99,10 @@ def main() -> int:
     # No se espera a que termine: la reproducción puede durar 5-20s y
     # bloquear aquí secuestraría al agente en cada respuesta.
     #
+    # --origen claude: la tarjeta distingue quién habla (plan v3 §8). Sin
+    # este flag el origen sería vacío y la etiqueta seguiría siendo la de
+    # siempre, así que este cambio es aditivo.
+    #
     # El texto entra por stdin y no por argv (hallazgo MEDIO de la revisión
     # del TTS): en argv quedaba legible en /proc/*/cmdline — la respuesta del
     # agente puede contener contenido de archivos o credenciales — y por
@@ -106,7 +110,7 @@ def main() -> int:
     # silencio. `hablar` ya lee stdin cuando no recibe argumentos.
     try:
         p = subprocess.Popen(
-            [str(Path(__file__).resolve().parent / "hablar")],
+            [str(Path(__file__).resolve().parent / "hablar"), "--origen", "claude"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -138,7 +142,7 @@ def main() -> int:
     # Sin wait ni communicate: el hook sale en milisegundos.
 
     # Solo el tamaño, nunca el texto: el contenido no debe quedar en la traza.
-    st.traza(f"hook-stop: lanzando hablar ({len(limpio)} car.)")
+    st.traza(f"hook-stop: lanzando hablar --origen claude ({len(limpio)} car.)")
     return 0
 
 
