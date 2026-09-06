@@ -111,6 +111,15 @@ ESTILOS = {
     st.HABLANDO: ("Claude hablando", (0.30, 0.78, 0.47), True),
 }
 
+# Nombres con sus mayúsculas correctas para los orígenes conocidos. Es una
+# tabla abierta, no un if cerrado: un origen que no esté aquí se dibuja
+# igualmente (capitalizado, "cursor" -> "Cursor") sin tocar código; la tabla
+# solo existe para las mayúsculas bonitas de los conocidos ("opencode" ->
+# "OpenCode"). El campo lo publica estado.py (contrato con @integracion)
+# y puede no venir: un agente.json escrito por una versión anterior no
+# debe romper el servicio en marcha.
+NOMBRES_ORIGEN = {"claude": "Claude", "opencode": "OpenCode"}
+
 # Estados en los que se está esperando a algo que puede tardar. Muestran los
 # segundos transcurridos: sin eso la tarjeta parece colgada, que es justo la
 # impresión que daba mientras el modelo tardaba 8 u 11 segundos.
@@ -157,6 +166,7 @@ class Indicador(Gtk.Window):
         self.estado = st.INACTIVO
         self.texto = ""
         self.original = ""
+        self.origen = ""  # quién publica el estado del agente, si lo dice
         self.ts = 0.0  # cuándo empezó la fase actual, para el reloj
         self.fase = 0.0  # avanza el latido
         self.opacidad = 0.0  # fundido de entrada/salida
@@ -258,9 +268,14 @@ class Indicador(Gtk.Window):
         if (self.estado == st.PEGADO and self._hover
                 and actual["estado"] == st.INACTIVO):
             return
+        # El origen también cuenta como cambio: si OpenCode releva a Claude
+        # sin cambiar de fase (los dos pasan por PENSANDO con el mismo
+        # texto), sin esta línea la etiqueta seguiría diciendo el nombre
+        # equivocado hasta el próximo cambio de fase.
         if (actual["estado"] != self.estado
                 or actual["texto"] != self.texto
-                or actual["original"] != self.original):
+                or actual["original"] != self.original
+                or self._origen_de(actual) != self.origen):
             self._cambiar_a(actual)
 
     def _raton_sobre_tarjeta(self):
@@ -423,6 +438,20 @@ class Indicador(Gtk.Window):
 
     # --- Estado ---------------------------------------------------------
 
+    @staticmethod
+    def _origen_de(actual):
+        """Origen del agente que publicó el estado, normalizado a texto.
+
+        Con .get() y nunca por índice: un agente.json escrito por una
+        versión anterior no lleva este campo y no debe romper el servicio
+        en marcha. El isinstance cubre además un valor corrupto (un null,
+        un número): .capitalize() al dibujar la etiqueta reventaría con
+        cualquier cosa que no sea str, y el indicador tiene que sobrevivir
+        a cualquier estado.
+        """
+        origen = actual.get("origen")
+        return origen if isinstance(origen, str) else ""
+
     def _cambiar_a(self, actual):
         # Cualquier estado nuevo reabre la tarjeta: si el usuario pulsó la X
         # (que solo oculta localmente), el próximo dictado la vuelve a mostrar.
@@ -437,6 +466,9 @@ class Indicador(Gtk.Window):
         self.estado = actual["estado"]
         self.texto = actual["texto"]
         self.original = actual["original"]
+        # Normalizado aquí (ver _origen_de) para que el dibujo pueda asumir
+        # que self.origen es siempre un str.
+        self.origen = self._origen_de(actual)
 
         if self.estado == st.INACTIVO:
             # Retirar la entrada ya: durante el fundido de salida la ventana
@@ -555,6 +587,21 @@ class Indicador(Gtk.Window):
             return False
 
         etiqueta, color, late = ESTILOS[self.estado]
+
+        # Los estados del agente llevan el nombre de quién los origina.
+        # Se resuelve aquí, en el punto de dibujo, y no en ESTILOS: el color
+        # y el latido son iguales para todos los orígenes, solo cambia el
+        # texto. La tabla solo pone las mayúsculas bonitas ("opencode" ->
+        # "OpenCode"); un origen desconocido se dibuja igual sin tocar
+        # código ("cursor" -> "Cursor pensando…"), y sin origen (un
+        # agente.json de una versión anterior) se cae en "Claude" y las
+        # etiquetas quedan como siempre -- regresión cero.
+        if self.estado in (st.PENSANDO, st.HABLANDO):
+            nombre = (NOMBRES_ORIGEN.get(self.origen)
+                      or self.origen.capitalize() or "Claude")
+            sufijo = "pensando…" if self.estado == st.PENSANDO else "hablando"
+            etiqueta = f"{nombre} {sufijo}"
+
         w, h = ANCHO_TARJETA, self.alto
         radio = min(ALTO_MINIMO / 2, 18 * ESCALA)
 

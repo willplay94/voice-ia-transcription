@@ -367,10 +367,161 @@ probada de punta a punta, la corrección de transcripciones funciona, y el
 TTS con ElevenLabs está implementado y enganchado a Claude Code. Lo que
 falta:
 
+- Panel de interfaz gráfica (registros, atajos, proveedores) — en diseño
 - Plugin de OpenCode sobre `session.idle` → `hablando` / `inactivo`
-- Revisión de @security sobre la superficie de privacidad del TTS
 - Streaming de MP3 para reducir latencia (reproducir antes de tener el
   archivo completo)
 - Mejorar la interfaz gráfica (distinguir Claude vs OpenCode)
 
 Mientras tanto, `voz-estado` publica los estados a mano y sirve para probar.
+
+## Instalación en otro computador
+
+Clonar el repo **no basta**: el servicio, los hooks y las claves viven
+*fuera* del repo y se referencian por ruta absoluta. Pasos completos,
+probados en Linux Mint 22 (Cinnamon, X11):
+
+### 1. Dependencias del sistema
+
+```sh
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-pangocairo-1.0 \
+                 python3-gi-cairo ydotool xclip pulseaudio-utils \
+                 speech-dispatcher libcairo2-dev
+```
+
+- `python3-gi` + `gir1.2-gtk-3.0`: PyGObject/GTK3 (la única dependencia
+  de Python; **no hay pip** y no se necesita).
+- `ydotool` + su demonio `ydotoold`: inyecta Ctrl+Shift+V en `pegar`.
+- `xclip`: reescritura del portapapeles en `pegar`.
+- `pulseaudio-utils`: `paplay` reproduce el MP3 del TTS.
+- `speech-dispatcher`: `spd-say`, respaldo local del TTS.
+
+Arrancar el demonio de ydotool (necesita permisos de `/dev/uinput`):
+
+```sh
+sudo systemctl enable --now ydotool
+# Si no arranca: sudo usermod -aG input $USER  (y reiniciar sesión)
+```
+
+### 2. Clonar el repo
+
+La ruta importa: el servicio y los hooks se referencian con la ruta
+absoluta del paso 3. Si clonas en otro sitio, ajusta las rutas ahí.
+
+```sh
+git clone https://github.com/willplay94/voice-ia-transcription.git \
+          ~/Proyectos/indicador-voz
+cd ~/Proyectos/indicador-voz
+chmod +x indicador.py corregir pegar voz-estado hablar hook-stop
+```
+
+### 3. Servicio systemd del indicador
+
+```sh
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/indicador-voz.service <<EOF
+[Unit]
+Description=Indicador flotante de estado de voz (VoxType + agente)
+# A propósito NO se usa graphical-session.target: en Cinnamon ese target
+# nunca se activa, y el servicio se quedaría parado sin dar ningún error.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=$HOME/Proyectos/indicador-voz/indicador.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now indicador-voz
+```
+
+### 4. Hooks de VoxType (dictado + corrección)
+
+Requiere VoxType instalado. En `~/.config/voxtype/config.toml`:
+
+```toml
+[output]
+post_output_command = "$HOME/Proyectos/indicador-voz/pegar"  # ruta absoluta
+
+[output.post_process]
+command = "$HOME/Proyectos/indicador-voz/corregir"           # ruta absoluta
+timeout_ms = 20000
+trim = true
+fallback_on_empty = true
+```
+
+(Usa la ruta absoluta real, no `$HOME`.) Si VoxType arranca antes que la
+sesión gráfica y `xclip` falla, añade un drop-in con el display:
+
+```sh
+mkdir -p ~/.config/systemd/user/voxtype.service.d
+cat > ~/.config/systemd/user/voxtype.service.d/display.conf <<EOF
+[Service]
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=$HOME/.Xauthority
+EOF
+systemctl --user daemon-reload
+```
+
+### 5. Hook de Claude Code (TTS)
+
+En `~/.claude/settings.json`, dentro del objeto raíz:
+
+```json
+"hooks": {
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "RUTA_ABSOLUTA/indicador-voz/hook-stop",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 6. Configuración y claves (fuera del repo)
+
+```sh
+mkdir -p ~/.config/indicador-voz
+```
+
+- **Corrector** (`~/.config/indicador-voz/corrector.json`, opcional):
+  proveedor/modelo del LLM y glosario. Sin él se usan los valores por
+  defecto (`gemma4:31b` por Ollama Cloud).
+- **TTS** (`~/.config/indicador-voz/hablar.json`, permisos 0600):
+
+```sh
+cat > ~/.config/indicador-voz/hablar.json <<'EOF'
+{
+  "activo": true,
+  "api_key": "TU_CLAVE_DE_ELEVENLABS",
+  "voz_id": "pNInz6obpgDQGcFmaJgB"
+}
+EOF
+chmod 600 ~/.config/indicador-voz/hablar.json
+```
+
+- **Claves del LLM**: variable de entorno `OLLAMA_API_KEY` /
+  `OPENROUTER_API_KEY`, o el archivo de OpenCode
+  `~/.local/share/opencode/auth.json` si lo usas.
+
+### 7. Verificar
+
+```sh
+systemctl --user status indicador-voz          # active
+echo "lo hice en Cloud IP con Boxed" | ./corregir   # corrige (llamada real)
+echo "Hola, esto es una prueba de voz" | ./hablar   # suena (llamada real)
+tail -f /run/user/$(id -u)/indicador-voz/traza.log  # depurar la cadena
+```
+
+Si algo no aparece en pantalla, revisa la traza: VoxType captura la
+salida de los hooks y un `print` no se ve en ninguna parte.
